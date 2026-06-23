@@ -1,0 +1,1 @@
+cd "/mnt/c/Users/NAR/documents/nex/transformer/SRC/Phase-2_Attention-Mechanism/Component-2.1_QKV-Projection" && g++ -std=c++17 -O1 test_pipeline.cpp -o test_pipeline -lpthread && timeout 120 ./test_pipeline

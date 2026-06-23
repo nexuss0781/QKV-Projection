@@ -1,0 +1,112 @@
+
+╔══════════════════════════════════════════════════════════╗
+║   Phase-1 → Phase-2.1 End-to-End Pipeline Test         ║
+║   Tokenize → Embed → Position-Encode → QKV Project     ║
+╚══════════════════════════════════════════════════════════╝
+
+▸ Stage 0: Configuration
+  V=1024 d=128 r=16 K=64 h=4 g=4 L=6
+
+▸ Stage 1: Bridge Creation (HFAQE SVD init, ~5s)...
+[EmbedPipeline] WARNING: tokenizer.vocab_size=256 != embedder.V=1024
+  [[32mPASS[0m] bridge_create: handle allocated
+  [[32mPASS[0m] dimension: d=128
+  [[32mPASS[0m] heads: h=4
+  [[32mPASS[0m] kv-groups: g=4
+  [[32mPASS[0m] d_k = 32
+  [[32mPASS[0m] d_v = 32
+  [[32mPASS[0m] vocab_size = 1024
+
+▸ Stage 2: Tokenize Sentences (C++ Tokenizer, Component 1.1)
+  [[32mPASS[0m]   [0] "hello world" → 11 tokens
+  [[32mPASS[0m]   [0] token IDs in [0, V)
+       IDs: 104 101 108 108 111 32 119 111 114 108 ...
+  [[32mPASS[0m]   [1] "the quick brown fox jumps over the lazy dog" → 43 tokens
+  [[32mPASS[0m]   [1] token IDs in [0, V)
+       IDs: 116 104 101 32 113 117 105 99 107 32 ...
+  [[32mPASS[0m]   [2] "attention is all you need" → 25 tokens
+  [[32mPASS[0m]   [2] token IDs in [0, V)
+       IDs: 97 116 116 101 110 116 105 111 110 32 ...
+  [[32mPASS[0m]   [3] "neural machine translation" → 26 tokens
+  [[32mPASS[0m]   [3] token IDs in [0, V)
+       IDs: 110 101 117 114 97 108 32 109 97 99 ...
+  [[32mPASS[0m]   [4] "transformer networks" → 20 tokens
+  [[32mPASS[0m]   [4] token IDs in [0, V)
+       IDs: 116 114 97 110 115 102 111 114 109 101 ...
+  [[32mPASS[0m]   total: 125 tokens across 5 sentences
+
+▸ Stage 3: Batch Assembly
+  [[32mPASS[0m] batch: 125 tokens
+
+▸ Stage 4: Embed + Position-Encode (Phase 1.2 + 1.3)
+  [[32mPASS[0m] X: all finite
+  [[32mPASS[0m] X: non-zero (embeddings active)
+  [[32mPASS[0m] X: RMS=0.048599 > 1e-6
+  [[32mPASS[0m] X: position-dependent (diff=0.6686, HDPE active)
+  X shape: [125 x 128]
+  X[0]:  [0.0330 -0.0338 -0.0279 0.0314 ...]
+  X[1]:  [-0.0143 -0.0211 0.0115 -0.0105 ...]
+
+▸ Stage 5: QKV Projection (SQFP, Component 2.1)
+  [[32mPASS[0m] Q: all finite
+  [[32mPASS[0m] K: all finite
+  [[32mPASS[0m] V: all finite
+  [[32mPASS[0m] Q: non-zero (projection active)
+  [[32mPASS[0m] K: non-zero
+  [[32mPASS[0m] V: non-zero
+  [[32mPASS[0m] Q: RMS=0.048599
+  Q shape: [125 x 4 x 32]  (16000 elems)
+  K shape: [125 x 4 x 32]  (16000 elems)
+  V shape: [125 x 4 x 32]  (16000 elems)
+  Q[0,h0]: [0.0330 -0.0338 -0.0279 0.0314 ...]
+  Q[0,h1]: [0.0054 0.0018 -0.0520 0.0787 ...]
+  K[0,g0]: [0.0330 -0.0338 -0.0279 0.0314 ...]
+  V[0,g0]: [0.0330 -0.0338 -0.0279 0.0314 ...]
+
+▸ Stage 6: GQA Expand K, V (g=4 -> h=4)
+  [[32mPASS[0m] K_exp: all finite
+  [[32mPASS[0m] V_exp: all finite
+  [[32mPASS[0m] K_exp: N x h x d_k
+  [[32mPASS[0m] V_exp: N x h x d_v
+  [[32mPASS[0m] GQA: K heads in same group are identical
+  K_exp shape: [125 x 4 x 32]
+  V_exp shape: [125 x 4 x 32]
+
+▸ Stage 7: Output Projection (Wo, Component 2.3 contract)
+  [[32mPASS[0m] Wo: all finite
+  [[32mPASS[0m] Wo: non-zero
+  [[32mPASS[0m] Wo: modifies values (max diff=0.071129)
+  Wo(out[0]): [0.0113 0.0123 -0.0123 -0.0041 ...]
+
+▸ Stage 8: KV Cache (Autoregressive Mode)
+  [[32mPASS[0m] KV cache: data written (sentinels overwritten)
+  [[32mPASS[0m] KV cache K: finite
+  [[32mPASS[0m] KV cache V: finite
+  [[32mPASS[0m] KV cache: RMS=0.048599 (values stored & retrieved)
+  [[32mPASS[0m] KV cache: partial lookup RMS=0.043395
+  [[32mPASS[0m] KV cache: matches batch K (l2 diff=0.000000)
+
+▸ Stage 9: End-to-End text->QKV (bridge_forward_text)
+  [[32mPASS[0m]   "end to end transformer pipeline verification" -> 44 tokens
+  [[32mPASS[0m] Q_text: all finite (n=44)
+  [[32mPASS[0m] K_text: all finite
+  [[32mPASS[0m] V_text: all finite
+
+▸ Stage 10: Adaptive Precision Diagnostics
+  [[32mPASS[0m] importance: [0.00 0.00 -0.00 0.00]
+
+╔══════════════════════════════════════════════════════════╗
+║   Summary                                              ║
+╚══════════════════════════════════════════════════════════╝
+  Tests: 49/49 passed
+
+  [32mQKV ready for Phase 2.2 (Scaled Dot-Product Attention)[0m
+
+  Q[16000]  = query heads  (N=125 x h=4 x d_k=32)
+  K_exp[16000] = key heads (broadcast N x h x d_k)
+  V_exp[16000] = value heads (broadcast N x h x d_v)
+
+  Attention computes:  Attn(Q,K,V) = softmax(Q*K^T/sqrt(d_k)) * V
+  Output:  X_attn[125 x 128] -> Wo -> residual
+
+  bridge_destroy: OK
