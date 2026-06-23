@@ -717,6 +717,6 @@ SOFTWARE.
 
 Built with rigour. Designed for scale. Made to run on your CPU.
 
-**[⭐ Star on GitHub](https://github.com/nexuss0781/Nexuss_Transformer)** · **[🐛 Report an Issue](https://github.com/nexuss0781/Nexuss_Transformer/issues)** · **[🔀 Open a PR](https://github.com/nexuss0781/Nexuss_Transformer/pulls)**
+**[⭐ Star on GitHub](https://github.com/nexuss0781/QKV-Projection)** · **[🐛 Report an Issue](https://github.com/nexuss0781/QKV-Projection/issues)** · **[🔀 Open a PR](https://github.com/nexuss0781/QKV-Projection/pulls)**
 
 </div>
