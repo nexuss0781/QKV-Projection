@@ -159,25 +159,53 @@ void bridge_wo_forward(
     size_t n
 );
 
-// KV-cache: compute K/V for one token and append to cache.
-void bridge_kv_cache_append(
+// KV-cache: HAF-AGE prefill (batched n tokens → compressed blocks).
+void bridge_haf_prefill(
     InputBridge* bridge,
-    const float* X_new,
-    float* K_cache,
-    float* V_cache,
-    size_t token_pos
+    const float* X,
+    size_t n,
+    size_t layer
 );
 
-// KV-cache: look up K/V from cache at given positions.
-void bridge_kv_cache_lookup(
-    const InputBridge* bridge,
-    const float* K_cache,
-    const float* V_cache,
-    float* K_out,
-    float* V_out,
-    const size_t* positions,
-    size_t n
+// KV-cache: HAF-AGE single token decode step (O(1) amortized).
+void bridge_haf_decode_step(
+    InputBridge* bridge,
+    const float* X_new,
+    size_t layer
 );
+
+// Export HAF-AGE S_total for a given layer.
+void bridge_haf_get_s_total(
+    const InputBridge* bridge,
+    float* S_total_out,
+    size_t layer
+);
+
+// Reconstruct approximate K,V prefix for a given layer.
+void bridge_haf_reconstruct(
+    const InputBridge* bridge,
+    float* K_hat,
+    float* V_hat,
+    size_t m,
+    size_t layer
+);
+
+// Reset HAF-AGE caches for a specific layer.
+void bridge_haf_reset(InputBridge* bridge, size_t layer);
+
+// Reset HAF-AGE caches for all layers.
+void bridge_haf_reset_all(InputBridge* bridge);
+
+// ---- Prefix Caching (Phase 9) ----
+// Export prefix snapshot for a layer. Caller must bridge_haf_free_prefix().
+typedef struct SQFPHAFPrefix SQFPHAFPrefix;
+SQFPHAFPrefix* bridge_haf_export_prefix(const InputBridge* bridge, size_t layer);
+
+// Import prefix snapshot into a layer.
+void bridge_haf_import_prefix(InputBridge* bridge, const SQFPHAFPrefix* snap, size_t layer);
+
+// Free a prefix snapshot.
+void bridge_haf_free_prefix(SQFPHAFPrefix* snap);
 
 
 // ==========================================================================
@@ -354,6 +382,27 @@ void bridge_embed_tokens(
     bridge->engine.forward(token_ids, n, out);
 }
 
+// Token IDs → raw embeddings only (no position encoding).
+void bridge_embed_only(
+    InputBridge* bridge,
+    const int* token_ids,
+    int n,
+    float* out
+) {
+    if (!bridge || !token_ids || !out) return;
+    bridge->engine.embed(token_ids, n, out);
+}
+
+// Apply HDPE RoPE position encoding in-place on pre-computed embeddings.
+void bridge_position_encode(
+    InputBridge* bridge,
+    float* X,
+    int n
+) {
+    if (!bridge || !X || n <= 0) return;
+    bridge->engine.apply_rotation(X, n);
+}
+
 
 // ==========================================================================
 // QKV Operations
@@ -381,28 +430,125 @@ void bridge_wo_forward(
     sqfp_wo_forward(bridge->sqfp, X_attn, Out, n);
 }
 
-void bridge_kv_cache_append(
+void bridge_haf_prefill(
     InputBridge* bridge,
-    const float* X_new,
-    float* K_cache,
-    float* V_cache,
-    size_t token_pos
+    const float* X,
+    size_t n,
+    size_t layer
 ) {
     if (!bridge || !bridge->sqfp) return;
-    sqfp_kv_cache_append(bridge->sqfp, X_new, K_cache, V_cache, token_pos);
+    sqfp_haf_prefill(bridge->sqfp, X, n, layer);
 }
 
-void bridge_kv_cache_lookup(
+void bridge_haf_decode_step(
+    InputBridge* bridge,
+    const float* X_new,
+    size_t layer
+) {
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_haf_decode_step(bridge->sqfp, X_new, layer);
+}
+
+void bridge_haf_get_s_total(
     const InputBridge* bridge,
-    const float* K_cache,
-    const float* V_cache,
-    float* K_out,
-    float* V_out,
-    const size_t* positions,
+    float* S_total_out,
+    size_t layer
+) {
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_haf_get_s_total(bridge->sqfp, S_total_out, layer);
+}
+
+void bridge_haf_reconstruct(
+    const InputBridge* bridge,
+    float* K_hat,
+    float* V_hat,
+    size_t m,
+    size_t layer
+) {
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_haf_reconstruct(bridge->sqfp, K_hat, V_hat, m, layer);
+}
+
+void bridge_haf_reset(InputBridge* bridge, size_t layer) {
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_haf_reset(bridge->sqfp, layer);
+}
+
+void bridge_haf_reset_all(InputBridge* bridge) {
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_haf_reset_all(bridge->sqfp);
+}
+
+SQFPHAFPrefix* bridge_haf_export_prefix(const InputBridge* bridge, size_t layer) {
+    if (!bridge || !bridge->sqfp) return nullptr;
+    return sqfp_haf_export_prefix(bridge->sqfp, layer);
+}
+
+void bridge_haf_import_prefix(InputBridge* bridge, const SQFPHAFPrefix* snap, size_t layer) {
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_haf_import_prefix(bridge->sqfp, snap, layer);
+}
+
+void bridge_haf_free_prefix(SQFPHAFPrefix* snap) {
+    sqfp_haf_free_prefix(snap);
+}
+
+
+void bridge_qkv_forward(
+    InputBridge* bridge,
+    const float* X,
+    float* Q,
+    float* K,
+    float* V,
     size_t n
 ) {
-    if (!bridge) return;
-    sqfp_kv_cache_lookup(bridge->sqfp, K_cache, V_cache, K_out, V_out, positions, n);
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_qkv_forward(bridge->sqfp, X, Q, K, V, n);
+}
+
+void bridge_set_adaptive_threshold(InputBridge* bridge, float tau) {
+    if (!bridge || !bridge->sqfp) return;
+    sqfp_set_adaptive_threshold(bridge->sqfp, tau);
+}
+
+size_t bridge_total_params(const InputBridge* bridge) {
+    if (!bridge || !bridge->sqfp) return 0;
+    return sqfp_total_params(bridge->sqfp);
+}
+
+size_t bridge_total_param_bytes(const InputBridge* bridge) {
+    if (!bridge || !bridge->sqfp) return 0;
+    return sqfp_total_param_bytes(bridge->sqfp);
+}
+
+void bridge_save_params(const InputBridge* bridge, float* buffer) {
+    if (!bridge || !bridge->sqfp || !buffer) return;
+    sqfp_save_params(bridge->sqfp, buffer);
+}
+
+void bridge_load_params(InputBridge* bridge, const float* buffer) {
+    if (!bridge || !bridge->sqfp || !buffer) return;
+    sqfp_load_params(bridge->sqfp, buffer);
+}
+
+void bridge_dense_weight_q(const InputBridge* bridge, float* W_dense) {
+    if (!bridge || !bridge->sqfp || !W_dense) return;
+    sqfp_dense_weight_q(bridge->sqfp, W_dense);
+}
+
+void bridge_dense_weight_k(const InputBridge* bridge, float* W_dense) {
+    if (!bridge || !bridge->sqfp || !W_dense) return;
+    sqfp_dense_weight_k(bridge->sqfp, W_dense);
+}
+
+void bridge_dense_weight_v(const InputBridge* bridge, float* W_dense) {
+    if (!bridge || !bridge->sqfp || !W_dense) return;
+    sqfp_dense_weight_v(bridge->sqfp, W_dense);
+}
+
+void bridge_dense_weight_o(const InputBridge* bridge, float* W_dense) {
+    if (!bridge || !bridge->sqfp || !W_dense) return;
+    sqfp_dense_weight_o(bridge->sqfp, W_dense);
 }
 
 

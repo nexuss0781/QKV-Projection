@@ -556,7 +556,7 @@ int main() {
 # Build the full Phase-1 → Phase-2.1 pipeline test
 cd Component-2.1_QKV-Projection
 g++ -std=c++17 -O1 test_pipeline.cpp -o test_pipeline -lpthread
-timeout 120 ./test_pipeline > result.txt
+./test_pipeline
 
 # Expected: 49/49 tests passed
 ```

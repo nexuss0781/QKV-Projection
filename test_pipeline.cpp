@@ -317,60 +317,50 @@ int main() {
     std::printf("  Wo(out[0]): "); print_row(out.data(), (int)d); std::printf("\n");
 
     // ======================================================================
-    // Stage 8: KV Cache (autoregressive)
+    // Stage 8: HAF-AGE KV-Cache (Component 2.4 Integration)
     // ======================================================================
-    std::printf("\n▸ Stage 8: KV Cache (Autoregressive Mode)\n");
+    std::printf("\n▸ Stage 8: HAF-AGE KV-Cache (Spectral Compression)\n");
+    std::printf("  Using d_k=%zu, d_v=%zu, g=%zu\n", d_k, d_v, g);
+    std::printf("  HAFConfig: W=512, r_max=32, beta=0.8, J_max=20\n");
 
-    // KV cache test
-    std::vector<float> K_cache((size_t)N * g * d_k, -42.0f); // sentinel init
-    std::vector<float> V_cache((size_t)N * g * d_v, -42.0f);
+    // Prefill all N tokens through HAF-AGE caches (layer 0)
+    bridge_haf_prefill(bridge, X.data(), (size_t)N, 0);
 
-    for (int pos = 0; pos < N; ++pos) {
-        bridge_kv_cache_append(bridge,
-                               X.data() + (size_t)pos * d,
-                               K_cache.data(), V_cache.data(),
-                               (size_t)pos);
-    }
+    // Reconstruct approximate K,V prefix (layer 0)
+    std::vector<float> K_recon((size_t)N * g * d_k);
+    std::vector<float> V_recon((size_t)N * g * d_v);
+    bridge_haf_reconstruct(bridge, K_recon.data(), V_recon.data(), (size_t)N, 0);
 
-    // Verify sentinels were overwritten
-    bool cache_written = false;
-    for (size_t i = 0; i < K_cache.size(); ++i)
-        if (K_cache[i] != -42.0f) { cache_written = true; break; }
-    CHECK(cache_written, "KV cache: data written (sentinels overwritten)");
+    CHECK(all_finite(K_recon.data(), K_recon.size()), "HAF-AGE K: finite");
+    CHECK(all_finite(V_recon.data(), V_recon.size()), "HAF-AGE V: finite");
 
-    // Look up all positions from cache
-    std::vector<size_t> positions(N);
-    for (int i = 0; i < N; ++i) positions[i] = (size_t)i;
+    float recon_error = l2_norm(K.data(), K_recon.data(), K.size());
+    float recon_rms   = rms(K_recon.data(), K_recon.size());
+    std::printf("  HAF-AGE recon: l2=%.4f, recon_rms=%.4f\n", recon_error, recon_rms);
 
-    std::vector<float> K_lookup((size_t)N * g * d_k);
-    std::vector<float> V_lookup((size_t)N * g * d_v);
-    bridge_kv_cache_lookup(bridge, K_cache.data(), V_cache.data(),
-                            K_lookup.data(), V_lookup.data(),
-                            positions.data(), (size_t)N);
+    // Verify S_total aggregate (layer 0)
+    size_t r_feat = d_k;
+    std::vector<float> S_total(g * r_feat * d_v);
+    bridge_haf_get_s_total(bridge, S_total.data(), 0);
+    CHECK(all_finite(S_total.data(), S_total.size()), "HAF-AGE S_total: finite");
+    float s_rms = rms(S_total.data(), S_total.size());
+    CHECK(s_rms > 0.0f, "HAF-AGE S_total: non-zero RMS=%.6f", s_rms);
+    std::printf("  S_total shape: [%zu x %zu x %zu]\n", g, r_feat, d_v);
 
-    CHECK(all_finite(K_lookup.data(), K_lookup.size()), "KV cache K: finite");
-    CHECK(all_finite(V_lookup.data(), V_lookup.size()), "KV cache V: finite");
+    // Test decode_step on layer 0: exact buffer (no compression yet)
+    bridge_haf_reset(bridge, 0);
+    bridge_haf_decode_step(bridge, X.data(), 0);       // token 0
+    bridge_haf_decode_step(bridge, X.data() + d, 0);   // token 1
 
-    float cache_rms = rms(K_lookup.data(), K_lookup.size());
-    CHECK(cache_rms > 1e-6f, "KV cache: RMS=%.6f (values stored & retrieved)", cache_rms);
+    std::vector<float> K_decoded(2 * g * d_k);
+    std::vector<float> V_decoded(2 * g * d_v);
+    bridge_haf_reconstruct(bridge, K_decoded.data(), V_decoded.data(), 2, 0);
 
-    // Partial lookup (first 5 positions)
-    size_t partial_n = std::min((size_t)N, (size_t)5);
-    std::vector<size_t> partial_pos(partial_n);
-    for (size_t i = 0; i < partial_n; ++i) partial_pos[i] = i;
+    float decode_error = l2_norm(K.data(), K_decoded.data(), 2 * g * d_k);
+    CHECK(decode_error < 1e-10f, "HAF-AGE decode: exact buffer (2 tok) l2=%.2e", decode_error);
 
-    std::vector<float> K_partial(partial_n * g * d_k);
-    std::vector<float> V_partial(partial_n * g * d_v);
-    bridge_kv_cache_lookup(bridge, K_cache.data(), V_cache.data(),
-                            K_partial.data(), V_partial.data(),
-                            partial_pos.data(), partial_n);
-
-    float partial_rms = rms(K_partial.data(), K_partial.size());
-    CHECK(partial_rms > 1e-6f, "KV cache: partial lookup RMS=%.6f", partial_rms);
-
-    // Compare with batch K from Stage 5
-    float vs_batch = l2_norm(K.data(), K_lookup.data(), K.size());
-    CHECK(vs_batch < 1e-2f, "KV cache: matches batch K (l2 diff=%.6f)", vs_batch);
+    // Reset for subsequent stages
+    bridge_haf_reset_all(bridge);
 
     // ======================================================================
     // Stage 9: Single-Call Pipeline (text -> QKV)

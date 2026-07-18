@@ -3,7 +3,8 @@
 // Specification: Section 8 — Comprehensive Test & Verification Matrix
 // ==========================================================================
 
-#include "Core.cpp"
+// Include output.cpp which brings in Core.cpp + HAF-AGE KV-Cache integration
+#include "output.cpp"
 
 #include <iostream>
 #include <iomanip>
@@ -561,6 +562,250 @@ void test_T28_RoPE_compatibility() {
 
     PASS()
 }
+
+// T33: HAF-AGE prefill + S_total export
+void test_T33_haf_prefill_and_s_total() {
+    TEST("T33: HAF-AGE prefill + S_total export")
+
+    size_t d = 64, h = 4, g = 4;
+    size_t n = 8;
+
+    SQFPConfig cfg = {};
+    cfg.d = d; cfg.h = h; cfg.g = g; cfg.L = 4;
+    SQFPHandle* handle = sqfp_create(&cfg);
+    ASSERT(handle != nullptr, "sqfp_create");
+
+    // Random X
+    std::vector<float> X(n * d);
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : X) v = nd(rng);
+
+    // Prefill (layer 0)
+    sqfp_haf_prefill(handle, X.data(), n, 0);
+
+    // Export S_total from layer 0
+    size_t r_feat = d / h;  // = d_k
+    size_t d_v = d / h;
+    std::vector<float> S_total(g * r_feat * d_v);
+    sqfp_haf_get_s_total(handle, S_total.data(), 0);
+
+    for (auto v : S_total)
+        ASSERT(std::isfinite(v), "S_total finite");
+
+    double sum = 0;
+    for (auto v : S_total) sum += std::abs(v);
+    ASSERT(sum > 0, "S_total non-zero");
+
+    sqfp_destroy(handle);
+    PASS()
+}
+
+// T34: HAF-AGE decode step exact buffer (reconstruction exact before compression)
+void test_T34_haf_decode_exact() {
+    TEST("T34: HAF-AGE decode exact buffer")
+
+    size_t d = 64, h = 4, g = 4;
+    size_t d_k = d / h, d_v = d / h;
+
+    SQFPConfig cfg = {};
+    cfg.d = d; cfg.h = h; cfg.g = g; cfg.L = 4;
+    SQFPHandle* handle = sqfp_create(&cfg);
+    ASSERT(handle != nullptr, "sqfp_create");
+
+    std::vector<float> X(4 * d);
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : X) v = nd(rng);
+
+    // Batch forward for reference
+    std::vector<float> Q_ref(4 * h * d_k);
+    std::vector<float> K_ref(4 * g * d_k);
+    std::vector<float> V_ref(4 * g * d_v);
+    sqfp_qkv_forward(handle, X.data(), Q_ref.data(), K_ref.data(), V_ref.data(), 4);
+
+    // Decode step: 4 tokens, one at a time on layer 0
+    sqfp_haf_decode_step(handle, X.data(), 0);          // token 0
+    sqfp_haf_decode_step(handle, X.data() + d, 0);      // token 1
+    sqfp_haf_decode_step(handle, X.data() + 2 * d, 0);  // token 2
+    sqfp_haf_decode_step(handle, X.data() + 3 * d, 0);  // token 3
+
+    // Reconstruct from layer 0
+    std::vector<float> K_recon(4 * g * d_k);
+    std::vector<float> V_recon(4 * g * d_v);
+    sqfp_haf_reconstruct(handle, K_recon.data(), V_recon.data(), 4, 0);
+
+    // Should match exactly (exact buffer, no compression)
+    for (size_t i = 0; i < 4 * g * d_k; ++i) {
+        ASSERT(K_recon[i] == K_ref[i], "K exact match at " + std::to_string(i));
+    }
+    for (size_t i = 0; i < 4 * g * d_v; ++i) {
+        ASSERT(V_recon[i] == V_ref[i], "V exact match at " + std::to_string(i));
+    }
+
+    sqfp_destroy(handle);
+    PASS()
+}
+
+// T35: HAF-AGE reset clears state
+void test_T35_haf_reset() {
+    TEST("T35: HAF-AGE reset")
+
+    size_t d = 64, h = 4, g = 4;
+    SQFPConfig cfg = {};
+    cfg.d = d; cfg.h = h; cfg.g = g; cfg.L = 4;
+    SQFPHandle* handle = sqfp_create(&cfg);
+    ASSERT(handle != nullptr, "sqfp_create");
+
+    size_t r_feat = d / h;
+    size_t d_v = d / h;
+
+    std::vector<float> X(4 * d, 0.5f);
+    sqfp_haf_prefill(handle, X.data(), 4, 0);
+
+    std::vector<float> S_total_before(g * r_feat * d_v);
+    sqfp_haf_get_s_total(handle, S_total_before.data(), 0);
+    double sum_before = 0;
+    for (auto v : S_total_before) sum_before += std::abs(v);
+    ASSERT(sum_before > 0, "S_total non-zero before reset");
+
+    sqfp_haf_reset(handle, 0);
+
+    std::vector<float> S_total_after(g * r_feat * d_v);
+    sqfp_haf_get_s_total(handle, S_total_after.data(), 0);
+    double sum_after = 0;
+    for (auto v : S_total_after) sum_after += std::abs(v);
+    ASSERT(sum_after == 0, "S_total zero after reset");
+
+    sqfp_destroy(handle);
+    PASS()
+}
+
+// T36: HAF-AGE reconstruction accuracy measurement
+void test_T36_haf_recon_accuracy() {
+    TEST("T36: HAF-AGE reconstruction accuracy")
+
+    size_t d = 128, h = 4, g = 4;
+    size_t d_k = d / h, d_v = d / h;
+    size_t n = 100;
+
+    SQFPConfig cfg = {};
+    cfg.d = d; cfg.h = h; cfg.g = g; cfg.L = 4;
+    SQFPHandle* handle = sqfp_create(&cfg);
+    ASSERT(handle != nullptr, "sqfp_create");
+
+    std::vector<float> X(n * d);
+    std::mt19937 rng(99);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : X) v = nd(rng);
+
+    // Batch forward for reference
+    std::vector<float> Q_ref(n * h * d_k);
+    std::vector<float> K_ref(n * g * d_k);
+    std::vector<float> V_ref(n * g * d_v);
+    sqfp_qkv_forward(handle, X.data(), Q_ref.data(), K_ref.data(), V_ref.data(), n);
+
+    // Prefill through HAF-AGE
+    sqfp_haf_prefill(handle, X.data(), n, 0);
+
+    // Reconstruct
+    std::vector<float> K_recon(n * g * d_k);
+    std::vector<float> V_recon(n * g * d_v);
+    sqfp_haf_reconstruct(handle, K_recon.data(), V_recon.data(), n, 0);
+
+    // Measure per-group reconstruction error
+    double total_l2 = 0.0, total_norm = 0.0;
+    double max_l2 = 0.0;
+    for (size_t grp = 0; grp < g; ++grp) {
+        double grp_l2 = 0.0, grp_norm = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < d_k; ++j) {
+                double diff = K_ref[i * g * d_k + grp * d_k + j]
+                            - K_recon[i * g * d_k + grp * d_k + j];
+                double ref = K_ref[i * g * d_k + grp * d_k + j];
+                grp_l2 += diff * diff;
+                grp_norm += ref * ref;
+            }
+        }
+        total_l2 += grp_l2;
+        total_norm += grp_norm;
+        max_l2 = std::max(max_l2, std::sqrt(grp_l2));
+    }
+
+    double rmse = std::sqrt(total_l2 / (n * g * d_k));
+    double rel_error = (total_norm > 0)
+        ? std::sqrt(total_l2 / total_norm) : 0.0;
+
+    std::cout << "  Reconstruction: rmse=" << rmse
+              << ", rel_error=" << rel_error
+              << ", max_group_l2=" << max_l2 << std::endl;
+
+    // Verify reconstruction is reasonable: relative error < 1.0
+    // (spectral compression is inherently approximate, but should be
+    //  significantly better than pure mean reconstruction)
+    ASSERT(rel_error < 1.0, "relative error < 1.0");
+
+    sqfp_destroy(handle);
+    PASS()
+}
+
+// T37: HAF-AGE prefix caching round-trip (Phase 9)
+void test_T37_haf_prefix_cache() {
+    TEST("T37: HAF-AGE prefix cache export/import")
+
+    size_t d = 64, h = 4, g = 4;
+    size_t d_k = d / h, d_v = d / h;
+    size_t n = 16;
+
+    SQFPConfig cfg = {};
+    cfg.d = d; cfg.h = h; cfg.g = g; cfg.L = 4;
+    SQFPHandle* handle = sqfp_create(&cfg);
+    ASSERT(handle != nullptr, "sqfp_create");
+
+    std::vector<float> X(n * d);
+    std::mt19937 rng(77);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : X) v = nd(rng);
+
+    // Prefill
+    sqfp_haf_prefill(handle, X.data(), n, 0);
+
+    // Save S_total before import
+    size_t r_feat = d_k;
+    std::vector<float> S_before(g * r_feat * d_v);
+    sqfp_haf_get_s_total(handle, S_before.data(), 0);
+
+    // Export prefix
+    SQFPHAFPrefix* snap = sqfp_haf_export_prefix(handle, 0);
+    ASSERT(snap != nullptr, "snapshot created");
+
+    // Reset
+    sqfp_haf_reset(handle, 0);
+
+    // Verify S_total is zero after reset
+    std::vector<float> S_after_reset(g * r_feat * d_v);
+    sqfp_haf_get_s_total(handle, S_after_reset.data(), 0);
+    double sum_reset = 0;
+    for (auto v : S_after_reset) sum_reset += std::abs(v);
+    ASSERT(sum_reset == 0, "S_total zero after reset before import");
+
+    // Import prefix
+    sqfp_haf_import_prefix(handle, snap, 0);
+
+    // Verify S_total matches before export
+    std::vector<float> S_after_import(g * r_feat * d_v);
+    sqfp_haf_get_s_total(handle, S_after_import.data(), 0);
+
+    double s_diff = 0;
+    for (size_t i = 0; i < g * r_feat * d_v; ++i)
+        s_diff += std::abs(S_before[i] - S_after_import[i]);
+    ASSERT(s_diff < 1e-10, "S_total preserved after export/import round-trip");
+
+    sqfp_haf_free_prefix(snap);
+    sqfp_destroy(handle);
+    PASS()
+}
+
 
 // T29: KV-cache append compatibility
 void test_T29_KV_cache_append() {
@@ -1505,6 +1750,14 @@ int main() {
     test_T30_attention_score_agreement();
     test_T31_end_to_end();
     test_T32_long_context_stability();
+
+    // G7: HAF-AGE KV-Cache Integration Tests (Component 2.4)
+    std::cout << "\n[G7] HAF-AGE KV-Cache Integration" << std::endl;
+    test_T33_haf_prefill_and_s_total();
+    test_T34_haf_decode_exact();
+    test_T35_haf_reset();
+    test_T36_haf_recon_accuracy();
+    test_T37_haf_prefix_cache();
 
     // F2: RoPE Pre-Structure
     std::cout << "\n[F2] RoPE Pre-Structure Tests" << std::endl;

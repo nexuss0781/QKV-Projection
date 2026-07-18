@@ -25,6 +25,10 @@
 
 #include "Core.cpp"
 
+// Include HAF-AGE KV-Cache (Component 2.4)
+// All HAF-AGE types are in namespace haf_age
+#include "../Component-2.4_KV-Cache/core.cpp"
+
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -161,39 +165,73 @@ void sqfp_wo_forward(
 
 
 // ==========================================================================
-// Downstream Interface — Component 2.4 (KV-Cache)
+// Downstream Interface — Component 2.4 (HAF-AGE KV-Cache)
 //
-// Contract (Section 7.2):
-//   K/V outputs in row-major layout (n, g, d_k)
-//   New tokens computed one-at-a-time (n_new = 1)
-//   Cache append is a simple memcpy into pre-allocated buffer
-//   Zero recomputation: token n+1 does not recompute tokens 1..n
+// Replaces the flat-buffer KV-cache with HAF-AGE's spectral compression.
+// Each SQFPHandle owns per-group HAF-AGE caches internally; no explicit
+// buffer management needed from the caller.
 //
-// The KV-cache stores only g groups (not h heads):
-//   KV_cache shape: (total_seq, g, d_k) for K, (total_seq, g, d_v) for V
+// Contract (SPEC §4–§5):
+//   - Prefill:     Batched prompt (n < W → exact; n ≥ W → compressed)
+//   - Decode step: O(1) exact buffer, W-token compression trigger
+//   - S_total:     Linear attention aggregate per group
+//   - Reconstruct: Approximate prefix from compressed blocks
 // ==========================================================================
 
-// Compute K/V for a single new token and append to cache.
-// KV_cache: pre-allocated circular buffer, offset is token position.
-void sqfp_kv_cache_append(
+// Prefill: process n tokens in batch for a given layer.
+// Internally calls sqfp_qkv_forward + per-group haf_age::HAFCache::prefill_populate.
+void sqfp_haf_prefill(
     SQFPHandle* handle,
-    const float* X_new,     // (d) — single token
-    float* K_cache,         // pre-allocated, offset = token_pos * g * d_k
-    float* V_cache,         // pre-allocated, offset = token_pos * g * d_v
-    size_t token_pos        // sequence position of this token
+    const float* X,     // (n, d) — input tokens (batched)
+    size_t n,
+    size_t layer        // transformer layer index
 );
 
-// Look up K/V from cache at given positions.
-// Contract: zero recomputation — cache values are immutable after write.
-void sqfp_kv_cache_lookup(
-    const SQFPHandle* handle, // shapes for stride computation
-    const float* K_cache,
-    const float* V_cache,
-    float* K_out,           // (n, g*d_k)
-    float* V_out,           // (n, g*d_v)
-    const size_t* positions, // token indices to read
-    size_t n
+// Decode step: one autoregressive token, O(1) amortized cache update.
+void sqfp_haf_decode_step(
+    SQFPHandle* handle,
+    const float* X_new,  // (d) — single new token
+    size_t layer
 );
+
+// Export S_total for a given layer.
+// S_total_out: pre-allocated (g × r_feat × d_v), row-major.
+void sqfp_haf_get_s_total(
+    const SQFPHandle* handle,
+    float* S_total_out,
+    size_t layer
+);
+
+// Reconstruct approximate K,V prefix for a given layer.
+// K_hat, V_hat: pre-allocated (m × g × d_k), (m × g × d_v).
+void sqfp_haf_reconstruct(
+    const SQFPHandle* handle,
+    float* K_hat,
+    float* V_hat,
+    size_t m,
+    size_t layer
+);
+
+// Reset HAF-AGE caches for a specific layer.
+void sqfp_haf_reset(SQFPHandle* handle, size_t layer);
+
+// Reset HAF-AGE caches for all layers.
+void sqfp_haf_reset_all(SQFPHandle* handle);
+
+// ---- Prefix Caching (Phase 9) ----
+// Snapshot: export all compressed blocks + S_total for a layer.
+// The snapshot can be imported into another handle for cross-sequence sharing.
+
+typedef struct SQFPHAFPrefix SQFPHAFPrefix;
+
+// Export prefix snapshot for a given layer. Returns opaque handle.
+SQFPHAFPrefix* sqfp_haf_export_prefix(const SQFPHandle* handle, size_t layer);
+
+// Import prefix snapshot into a given layer.
+void sqfp_haf_import_prefix(SQFPHandle* handle, const SQFPHAFPrefix* snap, size_t layer);
+
+// Free a prefix snapshot allocated by sqfp_haf_export_prefix.
+void sqfp_haf_free_prefix(SQFPHAFPrefix* snap);
 
 
 // ==========================================================================
@@ -265,6 +303,54 @@ void sqfp_dense_weight_o(const SQFPHandle* handle, float* W_dense);
 // Implementation
 // ==========================================================================
 
+// ==========================================================================
+// HAF-AGE Adapter: Float↔Double Conversion & Group Splitting
+// ==========================================================================
+
+namespace haf_adapter {
+
+// Convert a float flat array (row-major) into a haf_age::Matrix of doubles
+inline haf_age:: Matrix float_to_matrix(const float* src, size_t rows, size_t cols) {
+    haf_age::Matrix M(rows, cols);
+    for (size_t i = 0; i < rows; ++i)
+        for (size_t j = 0; j < cols; ++j)
+            M(i, j) = static_cast<double>(src[i * cols + j]);
+    return M;
+}
+
+// Convert a single float vector (length d) into a haf_age column vector ℝ^{d×1}
+inline haf_age::Matrix float_to_col(const float* src, size_t d) {
+    haf_age::Matrix v(d, 1);
+    for (size_t i = 0; i < d; ++i)
+        v(i, 0) = static_cast<double>(src[i]);
+    return v;
+}
+
+// Convert a haf_age::Matrix to a float flat array
+inline void matrix_to_float(const haf_age::Matrix& M, float* dst) {
+    for (size_t i = 0; i < M.rows(); ++i)
+        for (size_t j = 0; j < M.cols(); ++j)
+            dst[i * M.cols() + j] = static_cast<float>(M(i, j));
+}
+
+// Default HAF-AGE config for a given SQFP projector
+inline haf_age::HAFConfig make_haf_config(const SQFPShapes& shapes) {
+    haf_age::HAFConfig c;
+    c.d_k = shapes.d_k;
+    c.d_v = shapes.d_v;
+    // r_feat matches d_k per SPEC §4.4 (φ = elu+1 preserves dimension)
+    c.r_feat = shapes.d_k;
+    // W=512, r_max=32, β=0.8, J_max=20 — standard values per SPEC §4.1
+    c.W = 512;
+    c.r_max = 32;
+    c.beta = 0.8;
+    c.J_max = 20;
+    return c;
+}
+
+} // namespace haf_adapter
+
+
 struct SQFPHandle {
     SQFPConfig config;
     SQFPShapes shapes;
@@ -290,6 +376,12 @@ struct SQFPHandle {
     // Thread count
     size_t num_threads;
 
+    // ---- HAF-AGE KV-Cache (Component 2.4 Integration) ----
+    // Per-layer, per-group caches: haf_caches[layer][group]
+    haf_age::HAFConfig haf_cfg;
+    std::vector<std::vector<haf_age::HAFCache>> haf_caches;  // [L][g]
+    bool haf_initialized;
+
     SQFPHandle(SQFPConfig cfg)
         : config(cfg)
         , shapes(cfg.d, cfg.h, cfg.g)
@@ -302,6 +394,8 @@ struct SQFPHandle {
         , stream_cfg(cfg.L3_size_bytes > 0 ? cfg.L3_size_bytes : 32ULL * 1024 * 1024, cfg.d)
         , head_cfg(cfg.h, cfg.num_threads > 0 ? cfg.num_threads : std::thread::hardware_concurrency())
         , num_threads(cfg.num_threads > 0 ? cfg.num_threads : std::thread::hardware_concurrency())
+        , haf_cfg(haf_adapter::make_haf_config(shapes))
+        , haf_initialized(true)
     {
         if (cfg.adaptive) {
             size_t r = shapes.r();
@@ -309,6 +403,19 @@ struct SQFPHandle {
         }
         if (cfg.use_rope_pre) {
             apply_rope_pre_structure_to_projector(mha.theta_q, cfg.d, cfg.h);
+        }
+
+        // Initialize per-layer, per-group HAF-AGE caches
+        size_t L = cfg.L > 0 ? cfg.L : 1;
+        size_t G = shapes.g;
+        haf_caches.reserve(L);
+        for (size_t li = 0; li < L; ++li) {
+            std::vector<haf_age::HAFCache> layer_caches;
+            layer_caches.reserve(G);
+            for (size_t gi = 0; gi < G; ++gi) {
+                layer_caches.emplace_back(haf_cfg);
+            }
+            haf_caches.push_back(std::move(layer_caches));
         }
     }
 
@@ -450,68 +557,199 @@ void sqfp_wo_forward(
 
 
 // ==========================================================================
-// KV-Cache Operations
+// HAF-AGE KV-Cache Integration (Component 2.4)
+//
+// Replaces the raw flat-buffer cache with HAF-AGE's compressed spectral
+// representation. Per-group decoding, hierarchical merge, and linear
+// attention aggregate S_total.
+//
+// API Contract:
+//   sqfp_haf_prefill:         Batched prefill (n tokens → compressed blocks)
+//   sqfp_haf_decode_step:     Single token decode (O(1) amortized)
+//   sqfp_haf_get_s_total:     Export aggregate S_total for linear attention
+//   sqfp_haf_reconstruct:     Approximate K,V prefix reconstruction
+//   sqfp_haf_reset:           Clear all caches
 // ==========================================================================
 
-void sqfp_kv_cache_append(
+void sqfp_haf_prefill(
+    SQFPHandle* handle,
+    const float* X,
+    size_t n,
+    size_t layer
+) {
+    if (!handle || !X) return;
+    if (layer >= handle->haf_caches.size()) return;
+
+    size_t g = handle->shapes.g;
+    size_t d_k = handle->shapes.d_k;
+    size_t d_v = handle->shapes.d_v;
+    size_t m_K = g * d_k;
+    size_t m_V = g * d_v;
+
+    // Full QKV forward for all n tokens
+    std::vector<float> Q_buf(n * handle->shapes.m_Q());
+    std::vector<float> K_buf(n * m_K);
+    std::vector<float> V_buf(n * m_V);
+    sqfp_qkv_forward(handle, X, Q_buf.data(), K_buf.data(), V_buf.data(), n);
+
+    // Per-group: extract K_g ∈ ℝ^{n×d_k}, V_g ∈ ℝ^{n×d_v}, prefill
+    auto& layer_caches = handle->haf_caches[layer];
+    for (size_t grp = 0; grp < g; ++grp) {
+        haf_age::Matrix K_g(n, d_k);
+        for (size_t i = 0; i < n; ++i)
+            for (size_t j = 0; j < d_k; ++j)
+                K_g(i, j) = static_cast<double>(K_buf[i * m_K + grp * d_k + j]);
+
+        haf_age::Matrix V_g(n, d_v);
+        for (size_t i = 0; i < n; ++i)
+            for (size_t j = 0; j < d_v; ++j)
+                V_g(i, j) = static_cast<double>(V_buf[i * m_V + grp * d_v + j]);
+
+        layer_caches[grp].prefill_populate(K_g, V_g);
+    }
+}
+
+void sqfp_haf_decode_step(
     SQFPHandle* handle,
     const float* X_new,
-    float* K_cache,
-    float* V_cache,
-    size_t token_pos
+    size_t layer
 ) {
-    if (!handle || !X_new || !K_cache || !V_cache) return;
+    if (!handle || !X_new) return;
+    if (layer >= handle->haf_caches.size()) return;
 
     size_t g = handle->shapes.g;
     size_t d_k = handle->shapes.d_k;
     size_t d_v = handle->shapes.d_v;
 
-    // Buffers for single-token output
     std::vector<float> Q_buf(1 * handle->shapes.m_Q());
     std::vector<float> K_buf(1 * g * d_k);
     std::vector<float> V_buf(1 * g * d_v);
-
-    // Forward single token
     sqfp_qkv_forward(handle, X_new, Q_buf.data(), K_buf.data(), V_buf.data(), 1);
 
-    // Append to cache at token_pos
-    size_t k_offset = token_pos * g * d_k;
-    size_t v_offset = token_pos * g * d_v;
-    std::memcpy(K_cache + k_offset, K_buf.data(), g * d_k * sizeof(float));
-    std::memcpy(V_cache + v_offset, V_buf.data(), g * d_v * sizeof(float));
-
-    // Zero recomputation guaranteed: Q/K/V for token_pos depends only on
-    // X_new, not on any previous token's state (Section 7.2).
+    auto& layer_caches = handle->haf_caches[layer];
+    for (size_t grp = 0; grp < g; ++grp) {
+        haf_age::Matrix k_t = haf_adapter::float_to_col(
+            K_buf.data() + grp * d_k, d_k);
+        haf_age::Matrix v_t = haf_adapter::float_to_col(
+            V_buf.data() + grp * d_v, d_v);
+        layer_caches[grp].decode_step(k_t, v_t);
+    }
 }
 
-void sqfp_kv_cache_lookup(
+void sqfp_haf_get_s_total(
     const SQFPHandle* handle,
-    const float* K_cache,
-    const float* V_cache,
-    float* K_out,
-    float* V_out,
-    const size_t* positions,
-    size_t n
+    float* S_total_out,
+    size_t layer
 ) {
-    if (!K_cache || !V_cache || !K_out || !V_out || !positions) return;
-    if (!handle) return;
+    if (!handle || !S_total_out) return;
+    if (layer >= handle->haf_caches.size()) return;
 
-    size_t g   = handle->shapes.g;
+    size_t g = handle->shapes.g;
+    size_t r_feat = handle->haf_cfg.r_feat;
+    size_t d_v = handle->shapes.d_v;
+
+    const auto& layer_caches = handle->haf_caches[layer];
+    for (size_t grp = 0; grp < g; ++grp) {
+        const haf_age::Matrix& S = layer_caches[grp].S_total();
+        for (size_t i = 0; i < r_feat; ++i)
+            for (size_t j = 0; j < d_v; ++j)
+                S_total_out[grp * r_feat * d_v + i * d_v + j] =
+                    static_cast<float>(S(i, j));
+    }
+}
+
+void sqfp_haf_reconstruct(
+    const SQFPHandle* handle,
+    float* K_hat,
+    float* V_hat,
+    size_t m,
+    size_t layer
+) {
+    if (!handle || !K_hat || !V_hat) return;
+    if (layer >= handle->haf_caches.size()) return;
+
+    size_t g = handle->shapes.g;
     size_t d_k = handle->shapes.d_k;
     size_t d_v = handle->shapes.d_v;
 
-    size_t k_stride = g * d_k;
-    size_t v_stride = g * d_v;
+    const auto& layer_caches = handle->haf_caches[layer];
+    for (size_t grp = 0; grp < g; ++grp) {
+        auto [K_grp, V_grp] = layer_caches[grp].reconstruct_prefix(m);
 
-    for (size_t i = 0; i < n; ++i) {
-        size_t pos = positions[i];
-        std::memcpy(K_out + i * k_stride,
-                    K_cache + pos * k_stride,
-                    k_stride * sizeof(float));
-        std::memcpy(V_out + i * v_stride,
-                    V_cache + pos * v_stride,
-                    v_stride * sizeof(float));
+        for (size_t i = 0; i < m; ++i)
+            for (size_t j = 0; j < d_k; ++j)
+                K_hat[i * g * d_k + grp * d_k + j] =
+                    static_cast<float>(K_grp(i, j));
+        for (size_t i = 0; i < m; ++i)
+            for (size_t j = 0; j < d_v; ++j)
+                V_hat[i * g * d_v + grp * d_v + j] =
+                    static_cast<float>(V_grp(i, j));
     }
+}
+
+void sqfp_haf_reset(SQFPHandle* handle, size_t layer) {
+    if (!handle) return;
+    if (layer >= handle->haf_caches.size()) return;
+    for (auto& cache : handle->haf_caches[layer]) {
+        cache.reset();
+    }
+}
+
+void sqfp_haf_reset_all(SQFPHandle* handle) {
+    if (!handle) return;
+    for (auto& layer : handle->haf_caches) {
+        for (auto& cache : layer) {
+            cache.reset();
+        }
+    }
+}
+
+// ---- Prefix Caching Snapshot (Phase 9) ----
+
+struct SQFPHAFPrefix {
+    // Per-group compressed blocks: per_group_blocks[group][block_idx]
+    std::vector<std::vector<haf_age::HAFCacheBlock>> per_group_blocks;
+    // Per-group S_total: per_group_S_total[group]
+    std::vector<haf_age::Matrix> per_group_S_total;
+    size_t g;
+    haf_age::HAFConfig cfg;
+};
+
+SQFPHAFPrefix* sqfp_haf_export_prefix(const SQFPHandle* handle, size_t layer) {
+    if (!handle) return nullptr;
+    if (layer >= handle->haf_caches.size()) return nullptr;
+
+    size_t g = handle->shapes.g;
+    SQFPHAFPrefix* snap = new SQFPHAFPrefix();
+    snap->g = g;
+    snap->cfg = handle->haf_cfg;
+    snap->per_group_blocks.resize(g);
+    snap->per_group_S_total.resize(g);
+
+    for (size_t grp = 0; grp < g; ++grp) {
+        const auto& cache = handle->haf_caches[layer][grp];
+        cache.export_prefix(snap->per_group_blocks[grp],
+                            snap->per_group_S_total[grp]);
+    }
+    return snap;
+}
+
+void sqfp_haf_import_prefix(SQFPHandle* handle,
+                            const SQFPHAFPrefix* snap,
+                            size_t layer) {
+    if (!handle || !snap) return;
+    if (layer >= handle->haf_caches.size()) return;
+    if (snap->g != handle->shapes.g) return;
+
+    for (size_t grp = 0; grp < snap->g; ++grp) {
+        auto& cache = handle->haf_caches[layer][grp];
+        cache.import_prefix(snap->per_group_blocks[grp],
+                            snap->per_group_S_total[grp]);
+    }
+}
+
+void sqfp_haf_free_prefix(SQFPHAFPrefix* snap) {
+    delete snap;
 }
 
 
